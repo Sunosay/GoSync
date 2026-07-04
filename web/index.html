@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>GoSync · 本地文件夹同步</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">G●</span>
+      <span class="title">GoSync</span>
+      <span class="subtitle">本地文件夹同步</span>
+    </div>
+    <div class="device-info" id="deviceInfo">
+      <div class="kv">
+        <span class="k">本机 ID</span>
+        <code id="deviceId">…</code>
+        <button class="btn-ghost" id="copyIdBtn" title="复制">⎘</button>
+      </div>
+      <div class="kv">
+        <span class="k">监听</span>
+        <code id="deviceListen">…</code>
+      </div>
+    </div>
+  </header>
+
+  <main class="container">
+    <section class="card">
+      <header class="card-head">
+        <h2>同步文件夹</h2>
+        <div class="card-actions">
+          <button class="btn-ghost" id="refreshFoldersBtn">刷新</button>
+        </div>
+      </header>
+      <form id="addFolderForm" class="row-form">
+        <input type="text" id="folderPathInput" placeholder="例如 C:\Users\me\Documents" autocomplete="off" />
+        <button class="btn" type="submit">添加</button>
+      </form>
+      <ul id="folderList" class="folder-list"></ul>
+    </section>
+
+    <section class="card" id="filesCard" hidden>
+      <header class="card-head">
+        <h2>文件列表 <span class="muted" id="filesFolderName"></span></h2>
+        <div class="card-actions">
+          <label class="checkbox">
+            <input type="checkbox" id="withHash" />
+            <span>计算哈希</span>
+          </label>
+          <button class="btn-ghost" id="refreshFilesBtn">刷新</button>
+          <button class="btn-ghost" id="closeFilesBtn">关闭</button>
+        </div>
+      </header>
+      <div class="table-wrap">
+        <table class="files-table">
+          <thead>
+            <tr><th>相对路径</th><th class="num">大小</th><th>修改时间</th><th>哈希</th></tr>
+          </thead>
+          <tbody id="filesTbody"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="card">
+      <header class="card-head">
+        <h2>对端设备</h2>
+        <div class="card-actions">
+          <button class="btn-ghost" id="refreshPeersBtn">扫描</button>
+        </div>
+      </header>
+      <form id="connectForm" class="row-form">
+        <input type="text" id="peerIdInput" placeholder="对端 ID（可留空，只填地址）" autocomplete="off" />
+        <input type="text" id="peerAddrInput" placeholder="地址，例如 http://192.168.1.5:9000（可选）" autocomplete="off" />
+        <input type="text" id="peerNameInput" placeholder="备注名（可选）" autocomplete="off" />
+        <button class="btn" type="submit">连接</button>
+      </form>
+
+      <h3 class="sub">已连接</h3>
+      <ul id="peerList" class="peer-list"></ul>
+
+      <h3 class="sub">局域网内发现</h3>
+      <ul id="discoveredList" class="discovered-list"></ul>
+    </section>
+
+    <section class="card" id="syncCard" hidden>
+      <header class="card-head">
+        <h2>同步进度</h2>
+        <div class="card-actions">
+          <button class="btn-ghost" id="cancelSyncBtn">取消</button>
+        </div>
+      </header>
+      <div class="sync-meta">
+        <div><span class="k">对端</span><code id="syncPeer">…</code></div>
+        <div><span class="k">文件夹</span><code id="syncFolder">…</code></div>
+        <div><span class="k">任务 ID</span><code id="syncJobId">…</code></div>
+      </div>
+      <div class="progress">
+        <div class="bar"><div class="bar-fill" id="barFill"></div></div>
+        <div class="progress-text">
+          <span id="progressText">0 / 0</span>
+          <span class="muted" id="speedText">—</span>
+          <span class="muted" id="sizeText">0 B / 0 B</span>
+        </div>
+      </div>
+      <div class="current-file muted" id="currentFile">等待开始…</div>
+      <ul id="fileLog" class="file-log"></ul>
+    </section>
+
+    <section class="card">
+      <header class="card-head">
+        <h2>同步日志</h2>
+        <div class="card-actions">
+          <button class="btn-ghost" id="refreshJobsBtn">刷新</button>
+        </div>
+      </header>
+      <ul id="jobList" class="job-list"></ul>
+    </section>
+  </main>
+
+  <div id="toast" class="toast" hidden></div>
+
+  <script src="app.js"></script>
+</body>
+</html>
