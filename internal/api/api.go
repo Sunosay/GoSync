@@ -6,10 +6,12 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -79,7 +81,34 @@ func (s *Server) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/events", s.handleEvents)
 	mux.HandleFunc("/api/peer/manifest", s.handlePeerManifest)
 	mux.HandleFunc("/api/peer/file", s.handlePeerFile)
+	mux.HandleFunc("/api/peer/folder/ensure", s.handlePeerFolderEnsure)
 	mux.HandleFunc("/api/peer/info", s.handlePeerInfo)
+}
+
+// handlePeerFolderEnsure 确保远端的某个目录存在并已注册为同步文件夹。
+// query: ?folder=<path>&create=<true|false>
+//   - create=true 时若磁盘上不存在会自动创建空目录；
+//   - create=false（默认）时只检查/注册已存在的目录；
+// 返回 200 + JSON {abs, created, existed} 表明成功。
+func (s *Server) handlePeerFolderEnsure(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	folder := r.URL.Query().Get("folder")
+	autoCreate := r.URL.Query().Get("create") == "true" || r.URL.Query().Get("create") == "1"
+	abs, created, status, errMsg := s.resolvePeerFolderOpt(folder, autoCreate)
+	if status != http.StatusOK {
+		http.Error(w, errMsg, status)
+		return
+	}
+	// existed: 目录是否在 ensure 之前就存在
+	existed := !created
+	writeJSON(w, map[string]any{
+		"abs":     abs,
+		"created": created,
+		"existed": existed,
+	})
 }
 
 func (s *Server) handleInfo(w http.ResponseWriter, r *http.Request) {
@@ -492,38 +521,117 @@ func (s *Server) handlePeerInfo(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handlePeerManifest(w http.ResponseWriter, r *http.Request) {
 	folder := r.URL.Query().Get("folder")
-	if !s.isRegisteredFolder(folder) {
-		http.Error(w, "folder not registered", http.StatusForbidden)
+	abs, created, status, errMsg := s.resolvePeerFolder(folder)
+	if status != http.StatusOK {
+		http.Error(w, errMsg, status)
 		return
 	}
-	syncpkg.ReceiveManifest(w, r, folder)
+	if created {
+		// 提示本地端：远端自动注册了新文件夹，便于用户知晓
+		w.Header().Set("X-Folder-Created", "true")
+	}
+	syncpkg.ReceiveManifest(w, r, abs)
 }
 
 func (s *Server) handlePeerFile(w http.ResponseWriter, r *http.Request) {
 	folder := r.URL.Query().Get("folder")
-	if !s.isRegisteredFolder(folder) {
-		http.Error(w, "folder not registered", http.StatusForbidden)
+	abs, created, status, errMsg := s.resolvePeerFolder(folder)
+	if status != http.StatusOK {
+		http.Error(w, errMsg, status)
 		return
 	}
-	abs, err := filepath.Abs(folder)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
+	if created {
+		w.Header().Set("X-Folder-Created", "true")
 	}
 	syncpkg.ReceiveFile(w, r, abs)
 }
 
+// isRegisteredFolder 判断 path 是否已注册为同步文件夹。
+// 容忍 Windows 上的大小写差异、尾斜杠、相对路径等。
 func (s *Server) isRegisteredFolder(p string) bool {
-	abs, err := filepath.Abs(p)
+	abs, err := normalizeFolderPath(p)
 	if err != nil {
 		return false
 	}
 	for _, f := range s.Cfg.Snapshot().Folders {
-		if f == abs {
+		if pathEqual(abs, f) {
 			return true
 		}
 	}
 	return false
+}
+
+// resolvePeerFolder 用于对端 API：
+//  1. 路径归一化；
+//  2. 若已注册则直接返回；
+//  3. 若未注册但磁盘上存在该目录，则自动注册（避免误报 403）；
+//  4. 若磁盘上也不存在，根据 autoCreate 决定是否自动创建空目录并注册；
+//  5. 其它错误（如非目录、权限不足）返回 400/500。
+// 返回值：abs 绝对路径、created 是否本次新建了目录、status 响应码、errMsg 错误信息。
+func (s *Server) resolvePeerFolder(p string) (abs string, created bool, status int, errMsg string) {
+	return s.resolvePeerFolderOpt(p, false)
+}
+
+// resolvePeerFolderOpt 同上，但允许指定 autoCreate：true 时若目录不存在会尝试创建。
+func (s *Server) resolvePeerFolderOpt(p string, autoCreate bool) (abs string, created bool, status int, errMsg string) {
+	if strings.TrimSpace(p) == "" {
+		return "", false, http.StatusBadRequest, "folder 参数为空"
+	}
+	abs2, err := normalizeFolderPath(p)
+	if err != nil {
+		return "", false, http.StatusBadRequest, "path invalid: " + err.Error()
+	}
+	if s.isRegisteredFolder(abs2) {
+		return abs2, false, http.StatusOK, ""
+	}
+	// 未注册：检查磁盘
+	info, err := os.Stat(abs2)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			if autoCreate {
+				if mkErr := os.MkdirAll(abs2, 0o755); mkErr != nil {
+					return "", false, http.StatusInternalServerError, "自动创建远端目录失败: " + mkErr.Error()
+				}
+				if addErr := s.Cfg.AddFolder(abs2); addErr != nil {
+					return "", false, http.StatusInternalServerError, "自动注册新建目录失败: " + addErr.Error()
+				}
+				return abs2, true, http.StatusOK, ""
+			}
+			return "", false, http.StatusNotFound, "远端目录不存在且未注册: " + abs2
+		}
+		return "", false, http.StatusBadRequest, "无法访问远端目录: " + err.Error()
+	}
+	if !info.IsDir() {
+		return "", false, http.StatusBadRequest, "远端路径不是目录: " + abs2
+	}
+	if addErr := s.Cfg.AddFolder(abs2); addErr != nil {
+		return "", false, http.StatusInternalServerError, "自动注册远端目录失败: " + addErr.Error()
+	}
+	return abs2, true, http.StatusOK, ""
+}
+
+// normalizeFolderPath 将任意形式的路径转换为用于比较/存储的归一化绝对路径：
+//   - 解析为绝对路径
+//   - 清理 . / ..、多余分隔符
+//   - Windows 上做大小写归一化（NTFS/FAT 均不区分大小写）
+func normalizeFolderPath(p string) (string, error) {
+	abs, err := filepath.Abs(p)
+	if err != nil {
+		return "", err
+	}
+	abs = filepath.Clean(abs)
+	if runtime.GOOS == "windows" {
+		abs = strings.ToLower(abs)
+	}
+	return abs, nil
+}
+
+// pathEqual 跨平台路径相等比较：Windows 不区分大小写、其它平台精确匹配。
+func pathEqual(a, b string) bool {
+	if runtime.GOOS == "windows" {
+		return strings.EqualFold(a, b)
+	}
+	return a == b
 }
 
 func writeJSON(w http.ResponseWriter, v any) {

@@ -314,7 +314,10 @@
     if (activeSync) { toast("已有同步任务进行中", "error"); return; }
     // 让用户输入对端文件夹路径（默认与本端相同）
     const remote = prompt(
-      "本端要推送的文件夹：\n  " + folder + "\n\n请输入对端接收的文件夹路径（必须已在对端注册）",
+      "本端要推送的文件夹：\n  " + folder +
+        "\n\n请输入对端接收的文件夹路径。\n" +
+        "要求：该目录必须已存在于对端机器上（不存在时会自动创建空目录，\n" +
+        "      已存在但未注册时本软件会自动注册，无需手动操作）。",
       folder,
     );
     if (remote === null) return;
@@ -322,9 +325,43 @@
     // 同步 goroutine 在收到 POST 之后会立刻 Publish 事件，
     // 如果先 POST 再 openSSE，会丢失早期事件，导致 UI 一直停在“准备中”。
     openSSE();
+    // 拿到对端地址后，先确保对端目录存在并已注册，避免远端返回 403/404。
+    // 这样可以：
+    //   1. 在同步真正开始前给出明确错误反馈（不卡在“准备中”）
+    //   2. 对端缺失目录时自动创建，提升易用性
+    const peerInfo = await api("GET", "/api/peers");
+    const peer = (peerInfo || []).find((p) => p.id === peerId);
+    if (!peer) {
+      $("currentFile").textContent = "未找到对端信息";
+      toast("未找到对端 " + peerId, "error");
+      activeSync = null;
+      return;
+    }
+    try {
+      const ensureUrl = peer.address.replace(/\/$/, "") +
+        "/api/peer/folder/ensure?folder=" + encodeURIComponent(remote) + "&create=true";
+      const r = await fetch(ensureUrl, { method: "POST" });
+      if (!r.ok) {
+        const t = await r.text();
+        // 远端目录创建失败：清晰提示并终止流程
+        $("currentFile").textContent = "远端目录准备失败：" + t;
+        toast("远端目录准备失败：" + t, "error", 6000);
+        activeSync = null;
+        return;
+      }
+      const info = await r.json();
+      if (info && info.created) {
+        toast("已在对端创建并注册目录：" + info.abs, "success", 4000);
+      }
+    } catch (err) {
+      $("currentFile").textContent = "无法联系对端：" + err.message;
+      toast("无法联系对端：" + err.message, "error", 6000);
+      activeSync = null;
+      return;
+    }
     try {
       const r = await api("POST", "/api/sync/start", { peer_id: peerId, folder, remote_folder: remote });
-      activeSync = { jobId: r.job_id, peerId, folder, startedAt: Date.now(), lastEventAt: Date.now() };
+      activeSync = { jobId: r.job_id, peerId, folder, remoteFolder: remote, startedAt: Date.now(), lastEventAt: Date.now() };
       $("syncCard").hidden = false;
       $("syncJobId").textContent = r.job_id;
       $("syncPeer").textContent = peerId;
@@ -339,7 +376,7 @@
     } catch (err) {
       // 启动失败也要清掉状态，避免 UI 卡住
       $("currentFile").textContent = "启动失败：" + err.message;
-      toast("启动同步失败：" + err.message, "error", 5000);
+      toast("启动同步失败：" + err.message, "error", 6000);
       activeSync = null;
     }
   }

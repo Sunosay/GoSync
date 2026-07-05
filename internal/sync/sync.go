@@ -50,7 +50,8 @@ func BuildManifest(root string) (Manifest, error) {
 }
 
 // BuildRemoteManifest 请求对端清单。
-// remoteFolder 是对端注册过的文件夹绝对路径（发送端需要明确指定，因为两端路径可能不同）。
+// remoteFolder 是对端希望使用的文件夹绝对路径（两端路径可能不同，接收端会做归一化与自动注册）。
+// 返回的错误会明确区分：404（远端目录在磁盘上不存在）、403（对端拒绝）、其它网络/HTTP 错误。
 func BuildRemoteManifest(ctx context.Context, base, remoteFolder string) (Manifest, error) {
 	url := strings.TrimRight(base, "/") + "/api/peer/manifest?folder=" + urlQuery(remoteFolder)
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
@@ -59,16 +60,25 @@ func BuildRemoteManifest(ctx context.Context, base, remoteFolder string) (Manife
 	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return Manifest{}, err
+		return Manifest{}, fmt.Errorf("请求对端清单失败（%s）：%w", base, err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return Manifest{}, fmt.Errorf("remote manifest failed: %s: %s", resp.Status, string(body))
+		switch resp.StatusCode {
+		case http.StatusNotFound:
+			return Manifest{}, fmt.Errorf("对端目录不存在且未注册：%s（请先在对端软件中创建该目录，或在 UI 中添加同步文件夹）", remoteFolder)
+		case http.StatusForbidden:
+			return Manifest{}, fmt.Errorf("对端拒绝访问目录：%s（%s）", remoteFolder, string(body))
+		case http.StatusBadRequest:
+			return Manifest{}, fmt.Errorf("对端认为请求参数无效：%s（%s）", remoteFolder, string(body))
+		default:
+			return Manifest{}, fmt.Errorf("对端返回 %s：%s（folder=%s）", resp.Status, string(body), remoteFolder)
+		}
 	}
 	var m Manifest
 	if err := json.NewDecoder(resp.Body).Decode(&m); err != nil {
-		return Manifest{}, err
+		return Manifest{}, fmt.Errorf("解析对端清单失败：%w", err)
 	}
 	return m, nil
 }
