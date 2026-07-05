@@ -18,6 +18,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"gosync/internal/folders"
@@ -90,13 +91,15 @@ func ComputeDiff(local, remote Manifest) Diff {
 }
 
 // Hub 将同步进度事件分发给所有订阅者（SSE）。
+// subscribers 在并发场景下被读写（订阅/退订/广播），因此用 RWMutex 保护。
 type Hub struct {
+	mu          sync.RWMutex
 	subscribers map[chan Event]struct{}
 }
 
 // Event 是同步过程的一条进度/状态消息。
 type Event struct {
-	Type      string  `json:"type"` // start/plan/progress/file_done/done/error
+	Type      string  `json:"type"` // start/plan/progress/file_done/done/sync_error
 	JobID     string  `json:"job_id"`
 	Folder    string  `json:"folder,omitempty"`
 	Peer      string  `json:"peer,omitempty"`
@@ -119,9 +122,15 @@ func NewHub() *Hub {
 // Subscribe 订阅事件，返回只读 channel 和取消函数。
 func (h *Hub) Subscribe() (<-chan Event, func()) {
 	ch := make(chan Event, 32)
+	h.mu.Lock()
 	h.subscribers[ch] = struct{}{}
+	h.mu.Unlock()
 	return ch, func() {
-		delete(h.subscribers, ch)
+		h.mu.Lock()
+		if _, ok := h.subscribers[ch]; ok {
+			delete(h.subscribers, ch)
+		}
+		h.mu.Unlock()
 		close(ch)
 	}
 }
@@ -131,6 +140,8 @@ func (h *Hub) Publish(e Event) {
 	if e.At == 0 {
 		e.At = time.Now().UnixMilli()
 	}
+	h.mu.RLock()
+	defer h.mu.RUnlock()
 	for ch := range h.subscribers {
 		select {
 		case ch <- e:
@@ -176,13 +187,13 @@ func RunPush(ctx context.Context, hub *Hub, jobID, localRoot, peerBase, remoteFo
 	// 1. 构建本地清单
 	local, err := BuildManifest(localRoot)
 	if err != nil {
-		hub.Publish(Event{Type: "error", JobID: jobID, Message: "构建本地清单失败: " + err.Error()})
+		hub.Publish(Event{Type: "sync_error", JobID: jobID, Message: "构建本地清单失败: " + err.Error()})
 		return result, err
 	}
 	// 2. 拉取远端清单
 	remote, err := BuildRemoteManifest(ctx, peerBase, remoteFolder)
 	if err != nil {
-		hub.Publish(Event{Type: "error", JobID: jobID, Message: "拉取远端清单失败: " + err.Error()})
+		hub.Publish(Event{Type: "sync_error", JobID: jobID, Message: "拉取远端清单失败: " + err.Error()})
 		return result, err
 	}
 	// 3. 计算差异
@@ -209,7 +220,7 @@ func RunPush(ctx context.Context, hub *Hub, jobID, localRoot, peerBase, remoteFo
 		select {
 		case <-ctx.Done():
 			result.Finished = time.Now().Unix()
-			hub.Publish(Event{Type: "error", JobID: jobID, Message: "已取消"})
+			hub.Publish(Event{Type: "sync_error", JobID: jobID, Message: "已取消"})
 			return result, ctx.Err()
 		default:
 		}

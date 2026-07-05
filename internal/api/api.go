@@ -291,9 +291,9 @@ func (s *Server) handleSyncStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		PeerID  string `json:"peer_id"`
-		Folder  string `json:"folder"`        // 本端文件夹
-		Remote  string `json:"remote_folder"` // 可选：对端文件夹；缺省与 Folder 相同
+		PeerID string `json:"peer_id"`
+		Folder string `json:"folder"`        // 本端文件夹
+		Remote string `json:"remote_folder"` // 可选：对端文件夹；缺省与 Folder 相同
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -347,21 +347,31 @@ func (s *Server) handleSyncCancel(w http.ResponseWriter, r *http.Request) {
 		delete(s.jobCancel, jobID)
 	}
 	s.mu.Unlock()
-	if !ok {
-		http.Error(w, "job not found", http.StatusNotFound)
-		return
+	// 取消接口设计为幂等：任务已结束（jobCancel 中不存在）时也返回成功，
+	// 避免前端在任务完成后点击取消出现 404 报错导致流程卡死。
+	if ok {
+		cancel()
 	}
-	cancel()
-	writeJSON(w, map[string]any{"ok": true})
+	writeJSON(w, map[string]any{"ok": true, "found": ok})
 }
 
 func (s *Server) handleSyncJobs(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
-	logs := make([]map[string]any, 0, len(s.logFiles))
+	// 进行中的任务（jobCancel 中存在但还没移到 logFiles）
+	running := make([]map[string]any, 0, len(s.jobCancel))
+	for id := range s.jobCancel {
+		running = append(running, map[string]any{
+			"job_id": id,
+			"status": "running",
+		})
+	}
+	// 已完成的任务（日志已生成）
+	done := make([]map[string]any, 0, len(s.logFiles))
 	for id, path := range s.logFiles {
 		info, err := os.Stat(path)
-		logs = append(logs, map[string]any{
+		done = append(done, map[string]any{
 			"job_id": id,
+			"status": "done",
 			"log":    path,
 			"size": func() int64 {
 				if err == nil {
@@ -373,7 +383,9 @@ func (s *Server) handleSyncJobs(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	s.mu.Unlock()
-	writeJSON(w, logs)
+	// 合并：进行中的在前，已完成在后
+	out := append(running, done...)
+	writeJSON(w, out)
 }
 
 func (s *Server) handleSyncLog(w http.ResponseWriter, r *http.Request) {

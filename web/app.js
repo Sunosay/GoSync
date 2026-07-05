@@ -318,9 +318,13 @@
       folder,
     );
     if (remote === null) return;
+    // 先建立 SSE 连接，再发送同步请求：
+    // 同步 goroutine 在收到 POST 之后会立刻 Publish 事件，
+    // 如果先 POST 再 openSSE，会丢失早期事件，导致 UI 一直停在“准备中”。
+    openSSE();
     try {
       const r = await api("POST", "/api/sync/start", { peer_id: peerId, folder, remote_folder: remote });
-      activeSync = { jobId: r.job_id, peerId, folder };
+      activeSync = { jobId: r.job_id, peerId, folder, startedAt: Date.now(), lastEventAt: Date.now() };
       $("syncCard").hidden = false;
       $("syncJobId").textContent = r.job_id;
       $("syncPeer").textContent = peerId;
@@ -331,16 +335,35 @@
       $("speedText").textContent = "—";
       $("currentFile").textContent = "准备中…";
       $("fileLog").innerHTML = "";
-      openSSE();
+      ensureSyncWatchdog();
     } catch (err) {
-      toast("启动同步失败：" + err.message, "error");
+      // 启动失败也要清掉状态，避免 UI 卡住
+      $("currentFile").textContent = "启动失败：" + err.message;
+      toast("启动同步失败：" + err.message, "error", 5000);
+      activeSync = null;
     }
   }
 
   $("cancelSyncBtn").addEventListener("click", async () => {
     if (!activeSync) return;
-    try { await api("POST", "/api/sync/cancel?job_id=" + activeSync.jobId); }
-    catch (e) { toast(e.message, "error"); }
+    const jobId = activeSync.jobId;
+    const btn = $("cancelSyncBtn");
+    btn.disabled = true;
+    $("currentFile").textContent = "正在取消…";
+    // 无论后端响应如何都清理前端状态，避免任务已完成时返回 404 引发卡死
+    try {
+      await api("POST", "/api/sync/cancel?job_id=" + encodeURIComponent(jobId));
+    } catch (e) {
+      // 后端取消失败时（如任务已结束），仍视为已取消
+      console.warn("cancel request failed:", e);
+    } finally {
+      activeSync = null;
+      btn.disabled = false;
+      // 保留 syncCard 几秒后隐藏，方便用户看到“已取消”状态
+      setTimeout(() => {
+        if (!activeSync) $("syncCard").hidden = true;
+      }, 1500);
+    }
   });
 
   function openSSE() {
@@ -352,8 +375,12 @@
     sseSource.addEventListener("progress", (e) => onEvent("progress", e));
     sseSource.addEventListener("file_done", (e) => onEvent("file_done", e));
     sseSource.addEventListener("done", (e) => onEvent("done", e));
-    sseSource.addEventListener("error", (e) => {
-      // 由 onEvent 处理；这里避免重连风暴
+    // 注意：这里必须用后端的 sync_error 事件名而不是 "error"，
+    // 否则会被 EventSource 内置的 error 事件吞掉，错误信息无法到达 UI。
+    sseSource.addEventListener("sync_error", (e) => onEvent("sync_error", e));
+    sseSource.addEventListener("error", () => {
+      // EventSource 内置的 error：连接断开时触发，浏览器会自动重连。
+      // 这里只更新状态，不弹错误 toast（避免与真正的业务错误混淆）。
       if (sseSource && sseSource.readyState === EventSource.CLOSED) {
         sseSource = null;
       }
@@ -364,6 +391,7 @@
     let ev;
     try { ev = JSON.parse(e.data); } catch { return; }
     if (activeSync && ev.job_id && ev.job_id !== activeSync.jobId) return;
+    if (activeSync) activeSync.lastEventAt = Date.now();
     if (type === "start") {
       $("currentFile").textContent = "正在构建清单…";
     } else if (type === "plan") {
@@ -390,11 +418,71 @@
       activeSync = null;
       loadJobs();
       toast(ev.message || "同步完成", "success", 5000);
-    } else if (type === "error") {
-      $("currentFile").textContent = "出错：" + ev.message;
+    } else if (type === "sync_error") {
+      $("currentFile").textContent = "出错：" + (ev.message || "");
       activeSync = null;
-      toast(ev.message, "error", 5000);
+      toast(ev.message || "同步出错", "error", 5000);
     }
+  }
+
+  // === 同步超时监控 ===
+  // SSE 在某些边界场景下可能丢事件（连接被重置、buffer 满丢弃、页面切换等），
+  // 表现为 UI 卡在“准备中”。此 watchdog 定期检查任务是否已在后端结束，
+  // 若是则主动恢复 UI；若长时间无事件则提示用户。
+  let syncWatchdogTimer = null;
+  const SYNC_STALL_MS = 30000; // 30s 无任何事件视为“疑似卡住”
+  const SYNC_HARD_TIMEOUT_MS = 120000; // 120s 无任何事件强制清理
+  function ensureSyncWatchdog() {
+    if (syncWatchdogTimer) clearInterval(syncWatchdogTimer);
+    syncWatchdogTimer = setInterval(checkSyncProgress, 3000);
+  }
+  function stopSyncWatchdog() {
+    if (syncWatchdogTimer) {
+      clearInterval(syncWatchdogTimer);
+      syncWatchdogTimer = null;
+    }
+  }
+  async function checkSyncProgress() {
+    if (!activeSync) {
+      stopSyncWatchdog();
+      return;
+    }
+    const now = Date.now();
+    const sinceLast = now - (activeSync.lastEventAt || activeSync.startedAt || now);
+    if (sinceLast < SYNC_STALL_MS) return; // 还在正常节奏内，不打扰
+    // 拉取一次后端任务列表，确认任务状态
+    let jobs = [];
+    try {
+      jobs = await api("GET", "/api/sync/jobs");
+    } catch (_) {
+      return;
+    }
+    const me = activeSync.jobId;
+    const job = (jobs || []).find((j) => j.job_id === me);
+    if (job && job.status === "done") {
+      // 后端已完成，但 SSE 没收到 done/sync_error 事件，主动恢复 UI
+      $("currentFile").textContent = "同步完成（事件已恢复）";
+      $("barFill").style.width = "100%";
+      activeSync = null;
+      stopSyncWatchdog();
+      loadJobs();
+      toast("同步已完成", "success", 5000);
+      return;
+    }
+    if (sinceLast >= SYNC_HARD_TIMEOUT_MS) {
+      // 长时间无事件，强制清理并尝试取消后端任务
+      const jobId = activeSync.jobId;
+      activeSync = null;
+      stopSyncWatchdog();
+      $("currentFile").textContent = "同步超时未响应，已自动取消";
+      try {
+        await api("POST", "/api/sync/cancel?job_id=" + encodeURIComponent(jobId));
+      } catch (_) {}
+      toast("同步超时，已自动取消", "error", 5000);
+      return;
+    }
+    // 任务仍在进行（building manifest / transfer），提示但不打断
+    $("currentFile").textContent = "等待后端响应…（已 " + Math.floor(sinceLast / 1000) + "s 未收到事件）";
   }
 
   // === 任务日志 ===
